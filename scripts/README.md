@@ -5,11 +5,31 @@
 | Script | Purpose |
 | --- | --- |
 | [robodojo.sh](robodojo.sh) | Main CLI: `doctor`, `eval`, `client`, `smoke`, `benchmark`, `dimensions`, `summarize`, `tasks` |
-| [install.sh](install.sh) | One-time environment setup (conda, Isaac Sim, submodules) |
+| [install.sh](install.sh) | User-local setup (`uv`, Python 3.11, Isaac Sim, pinned submodules); no `apt` or Conda |
 | [init_assets.sh](init_assets.sh) | Download robot/object assets |
 | [eval_policy.sh](eval_policy.sh) | Isaac Sim eval client (called by `robodojo.sh client` and XPolicyLab) |
 
 ## Typical eval flow
+
+For a native install without root access:
+
+```bash
+bash scripts/install.sh --install
+source .venv/bin/activate
+bash scripts/init_assets.sh
+bash scripts/robodojo.sh doctor --sim-env .venv
+```
+
+The installer writes only beneath this checkout (`.tools/`, `.venv/`, `.cache/`, and
+the Git submodule directories). It needs existing `curl`, Git LFS, a C/C++ compiler,
+`make`, and the host NVIDIA driver. It installs CMake and Ninja into `.venv`.
+Because this host has CUDA 13 while RoboDojo's PyTorch wheel uses CUDA 12.8,
+the installer downloads the NVIDIA CUDA 12.8 runfile and installs **toolkit only**
+under `.tools/cuda-12.8` if a CUDA 12.8 toolkit is not already available. The
+runfile download is several gigabytes; it never requests a driver install.
+Use `--from STEP` to resume after a failed download or build. Running an evaluation
+also requires a policy server and assets; Isaac Sim camera rendering must be tested
+on the host GPU before assuming the benchmark works.
 
 ```text
 robodojo.sh eval

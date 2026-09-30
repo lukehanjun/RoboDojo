@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 export PIP_USER=0
 export PYTHONNOUSERSITE=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURRENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOLS_DIR="${CURRENT_DIR}/.tools"
+VENV_DIR="${CURRENT_DIR}/.venv"
+UV_BIN="${TOOLS_DIR}/bin/uv"
+export PATH="${TOOLS_DIR}/bin:${PATH}"
+export UV_CACHE_DIR="${CURRENT_DIR}/.cache/uv"
+export PIP_CACHE_DIR="${CURRENT_DIR}/.cache/pip"
+export UV_PYTHON_INSTALL_DIR="${TOOLS_DIR}/python"
+export UV_PYTHON_BIN_DIR="${TOOLS_DIR}/bin"
 ISAACLAB_RL_FRAMEWORK="${ISAACLAB_RL_FRAMEWORK:-none}"
 # ── Helpers ────────────────────────────────────────────────────────────────────
 info()  { echo -e "\e[1;32m>>> $*\e[0m"; }
@@ -68,52 +76,37 @@ pin_runtime_deps() {
   python -m pip uninstall -y python-discovery 2>/dev/null || true
 }
 # ── Step functions ─────────────────────────────────────────────────────────────
-setup_system() {
-  local missing=()
-  for pkg in cmake build-essential ffmpeg; do
-    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+setup_tools() {
+  for tool in curl git gcc g++ make; do
+    command -v "$tool" >/dev/null 2>&1 || error "Missing host tool: $tool. This installer cannot add system packages."
   done
-  if [ ${#missing[@]} -gt 0 ]; then
-    info "[0/7] Installing system dependencies: ${missing[*]}..."
-    if [ "$(id -u)" -ne 0 ]; then
-      warn "    You need sudo privileges to install system packages. Please enter your password."
-      sudo apt-get update && sudo apt-get install -y "${missing[@]}"
-    else
-      apt-get update && apt-get install -y "${missing[@]}"
-    fi
-  else
-    warn "[0/7] System dependencies already installed, skipping..."
+  git lfs version >/dev/null 2>&1 || error "git-lfs is required to fetch RoboDojo assets."
+  if [[ ! -x "$UV_BIN" ]]; then
+    info "[0/8] Installing uv under ${TOOLS_DIR}..."
+    mkdir -p "$TOOLS_DIR/bin"
+    # The official installer only writes the uv executable here; it does not edit shell profiles.
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="${TOOLS_DIR}/bin" UV_NO_MODIFY_PATH=1 sh
   fi
+  [[ -x "$UV_BIN" ]] || error "uv bootstrap did not create ${UV_BIN}"
 }
-setup_conda() {
-  if ! command -v conda &>/dev/null; then
-    info "[1/7] Installing Miniconda..."
-    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -q
-    bash Miniconda3-latest-Linux-x86_64.sh -b -p "$HOME/miniconda3"
-    rm -f Miniconda3-latest-Linux-x86_64.sh
-    "$HOME/miniconda3/bin/conda" init bash
-    eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
-    info "    Accepting Anaconda Terms of Service..."
-    "$HOME/miniconda3/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-    "$HOME/miniconda3/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-  else
-    warn "[1/7] Conda already installed, skipping..."
-    eval "$(conda shell.bash hook)"
-    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
-    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
+activate_venv() {
+  [[ -f "${VENV_DIR}/bin/activate" ]] || error "Missing ${VENV_DIR}; start with --from venv."
+  # shellcheck disable=SC1091
+  source "${VENV_DIR}/bin/activate"
+  [[ "$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" == "3.11" ]] \
+    || error "${VENV_DIR} must use Python 3.11"
+}
+setup_venv() {
+  info "[1/8] Creating repo-local Python 3.11 environment..."
+  [[ -x "$UV_BIN" ]] || setup_tools
+  if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
+    "$UV_BIN" venv --python 3.11 --seed "$VENV_DIR"
   fi
-  if ! conda env list | grep -q "^RoboDojo "; then
-    info "    Creating conda environment 'RoboDojo' (Python 3.11)..."
-    conda create -n RoboDojo python=3.11 -y
-  else
-    warn "    Conda environment 'RoboDojo' already exists, skipping..."
-  fi
-  info "    Activating environment 'RoboDojo'..."
-  source "$HOME/miniconda3/bin/activate" RoboDojo 2>/dev/null || conda activate RoboDojo
-  [[ "$CONDA_DEFAULT_ENV" == "RoboDojo" ]] || error "Failed to activate conda environment 'RoboDojo'"
+  activate_venv
+  pip_install cmake ninja
 }
 setup_base_deps() {
-  info "[2/7] Installing base pip dependencies..."
+  info "[2/8] Installing base pip dependencies..."
   pip_install -r "$CURRENT_DIR/scripts/requirements.txt"
   pip_install opencv-python-headless==4.11.0.86 pillow matplotlib "scipy==1.15.3" scikit-learn
   pip_install numpy==1.26.0
@@ -121,11 +114,11 @@ setup_base_deps() {
 setup_submodules() {
   cd "$CURRENT_DIR" || exit 1
   local subs=(third_party/IsaacLab third_party/curobo XPolicyLab)
-  info "[3/7] Syncing and updating submodules from remote..."
-  git submodule sync "${subs[@]}"
+  info "[3/8] Initializing submodules at the commits pinned by this checkout..."
+  git submodule sync -- "${subs[@]}"
   for sub in "${subs[@]}"; do
-    info "    Updating ${sub} from remote..."
-    git submodule update --init --remote --progress "$sub" || {
+    info "    Initializing ${sub}..."
+    git submodule update --init --progress -- "$sub" || {
       [ "$sub" = "XPolicyLab" ] && error "Failed to clone XPolicyLab. Ensure HTTPS auth (e.g. gh auth login)."
       error "Failed to update $sub."
     }
@@ -133,9 +126,37 @@ setup_submodules() {
   [ -f "XPolicyLab/client_server/ws/model_client.py" ] \
     || error "XPolicyLab init failed. Check repo access."
 }
+activate_cuda() {
+  local candidate
+  for candidate in "${CUDA_HOME:-}" "${TOOLS_DIR}/cuda-12.8" /usr/local/cuda-12.8; do
+    [[ -n "$candidate" && -x "$candidate/bin/nvcc" ]] || continue
+    if "$candidate/bin/nvcc" --version | grep -q 'release 12\.8'; then
+      export CUDA_HOME="$candidate"
+      export PATH="${CUDA_HOME}/bin:${PATH}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+      return 0
+    fi
+  done
+  return 1
+}
+setup_cuda() {
+  if activate_cuda; then
+    info "[4/8] Using CUDA toolkit 12.8 at ${CUDA_HOME}"
+    return
+  fi
+  info "[4/8] Installing CUDA toolkit 12.8 under ${TOOLS_DIR}; host driver is untouched..."
+  local installer="${CURRENT_DIR}/.cache/cuda/cuda_12.8.1_570.124.06_linux.run"
+  mkdir -p "$(dirname "$installer")" "${TOOLS_DIR}/cuda-12.8" "${TOOLS_DIR}/cuda-defaultroot"
+  curl -fL --retry 3 -C - -o "$installer" \
+    https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
+  sh "$installer" --silent --toolkit \
+    --toolkitpath="${TOOLS_DIR}/cuda-12.8" \
+    --defaultroot="${TOOLS_DIR}/cuda-defaultroot"
+  activate_cuda || error "CUDA toolkit 12.8 installation failed"
+}
 setup_isaacsim() {
   if ! python -m pip show isaacsim 2>/dev/null | grep -q "5.1.0"; then
-    info "[4/7] Installing PyTorch + IsaacSim 5.1..."
+    info "[5/8] Installing PyTorch + IsaacSim 5.1..."
     pip_install --upgrade pip
     pip_install "numpy==1.26.0" "typing_extensions==4.12.2" "filelock==3.13.1"
     pip_install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
@@ -143,14 +164,14 @@ setup_isaacsim() {
     pip_install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
     pin_runtime_deps
   else
-    warn "[4/7] IsaacSim 5.1.0 already installed, skipping..."
+    warn "[5/8] IsaacSim 5.1.0 already installed, skipping..."
     ensure_torch_cuda_stack
   fi
 }
 setup_isaaclab() {
   cd "$CURRENT_DIR" || exit 1
   if ! python -m pip show isaaclab &>/dev/null; then
-    info "[5/7] Installing IsaacLab (rl-framework: ${ISAACLAB_RL_FRAMEWORK})..."
+    info "[6/8] Installing IsaacLab (rl-framework: ${ISAACLAB_RL_FRAMEWORK})..."
     cd third_party/IsaacLab || error "third_party/IsaacLab not found"
     export OMNI_KIT_ACCEPT_EULA=YES
     # isaaclab.sh calls `tabs`; fails when TERM=dumb (CI / piped shells)
@@ -160,7 +181,7 @@ setup_isaaclab() {
     ensure_torch_cuda_stack
     pin_runtime_deps
   else
-    warn "[5/7] IsaacLab already installed, skipping..."
+    warn "[6/8] IsaacLab already installed, skipping..."
   fi
 }
 setup_curobo() {
@@ -178,14 +199,14 @@ PY
     fi
   fi
   if [ "$need_install" -eq 1 ]; then
-    info "[6/7] Installing CuRobo..."
+    info "[7/8] Installing CuRobo..."
     cd third_party/curobo || error "third_party/curobo not found"
     python -m pip uninstall -y nvidia-curobo curobo 2>/dev/null || true
     pip_install_with_isaac_constraints -e ".[cu12]" --no-build-isolation
     cd "$CURRENT_DIR"
     pin_runtime_deps
   else
-    warn "[6/7] CuRobo v2 already installed and importable, skipping..."
+    warn "[7/8] CuRobo v2 already installed and importable, skipping..."
     pin_runtime_deps
   fi
 }
@@ -194,13 +215,14 @@ usage() {
   echo "Usage: $0 [-i | --from <step>]"
   echo "  -i, --install          Full install (all steps)"
   echo "  --from <step>          Resume from a specific step:"
-  echo "                           system | conda | base_deps | submodules | isaacsim | isaaclab | curobo"
+  echo "                           tools | venv | base_deps | submodules | cuda | isaacsim | isaaclab | curobo"
+  echo "  Tools, Python packages, CUDA toolkit, and caches stay under this checkout."
   echo "  ISAACLAB_RL_FRAMEWORK  IsaacLab RL extras to install (default: none; use all/sb3/skrl/etc. if needed)"
   echo "  -h, --help             Show this help"
 }
 run_from() {
   local from="$1"
-  local steps=(system conda base_deps submodules isaacsim isaaclab curobo)
+  local steps=(tools venv base_deps submodules cuda isaacsim isaaclab curobo)
   local start=0
   local found=0
   for i in "${!steps[@]}"; do
@@ -211,9 +233,11 @@ run_from() {
     fi
   done
   [ "$found" -eq 1 ] || error "Unknown step '$from'. Valid: ${steps[*]}"
-  if [ "$from" != "system" ] && [ "$from" != "conda" ]; then
-    eval "$(conda shell.bash hook)" 2>/dev/null || true
-    source "$HOME/miniconda3/bin/activate" RoboDojo 2>/dev/null || conda activate RoboDojo 2>/dev/null || true
+  if [[ "$from" != "tools" && "$from" != "venv" ]]; then
+    activate_venv
+  fi
+  if [[ "$from" == "isaacsim" || "$from" == "isaaclab" || "$from" == "curobo" ]]; then
+    activate_cuda || error "CUDA toolkit 12.8 missing; resume with --from cuda"
   fi
   for i in "${!steps[@]}"; do
     if [ "$i" -ge "$start" ]; then
@@ -226,15 +250,15 @@ case "${1:-}" in
     usage
     ;;
   -i|--install)
-    run_from system
+    run_from tools
     info "Develop environment setup completed."
-    warn "Activate the environment: conda activate RoboDojo"
+    info "Activate the environment: source ${VENV_DIR}/bin/activate"
     ;;
   --from)
     [ -n "${2:-}" ] || { echo "Error: --from requires a step name"; usage; exit 1; }
     run_from "$2"
     info "Resumed from '$2' — done."
-    warn "Activate the environment: conda activate RoboDojo"
+    info "Activate the environment: source ${VENV_DIR}/bin/activate"
     ;;
   *)
     usage

@@ -8,7 +8,7 @@ policy_dir=""
 env_cfg="arx_x5"
 task_name="stack_bowls"
 ckpt_name=""
-sim_env="RoboDojo"
+sim_env="${ROBODOJO_SIM_ENV:-RoboDojo}"
 policy_env=""
 skip_isaac="false"
 skip_conda="false"
@@ -198,7 +198,24 @@ else
   record "FAIL" "python import" "cannot import env.global_configs"
 fi
 
-if [[ "${skip_conda}" == "true" ]]; then
+sim_python=""
+if [[ "${sim_env}" == */* || -d "${ROOT_DIR}/${sim_env}" ]]; then
+  if [[ "${sim_env}" = /* ]]; then
+    sim_python="${sim_env}/bin/python"
+  else
+    sim_python="${ROOT_DIR}/${sim_env}/bin/python"
+  fi
+elif [[ "${sim_env}" == "RoboDojo" && -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+  sim_python="${ROOT_DIR}/.venv/bin/python"
+fi
+
+if [[ -n "${sim_python}" ]]; then
+  if [[ -x "${sim_python}" ]]; then
+    record "PASS" "sim Python env" "${sim_python}"
+  else
+    record "FAIL" "sim Python env" "missing ${sim_python}"
+  fi
+elif [[ "${skip_conda}" == "true" ]]; then
   record "WARN" "conda envs" "skipped by --skip-conda"
 elif command -v conda >/dev/null 2>&1; then
   envs="$(conda env list | awk 'NF && $1 !~ /^#/ {print $1}')"
@@ -222,6 +239,12 @@ fi
 
 if [[ "${skip_isaac}" == "true" ]]; then
   record "WARN" "Isaac imports" "skipped by --skip-isaac"
+elif [[ -n "${sim_python}" && -x "${sim_python}" ]]; then
+  if "${sim_python}" -c 'import isaacsim; import isaaclab'; then
+    record "PASS" "Isaac imports" "isaacsim and isaaclab import in ${sim_python}"
+  else
+    record "FAIL" "Isaac imports" "isaacsim/isaaclab import failed in ${sim_python}"
+  fi
 elif command -v conda >/dev/null 2>&1; then
   if conda run -n "${sim_env}" python - <<'PY'; then
 import isaacsim  # noqa: F401

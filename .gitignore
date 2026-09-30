@@ -17,6 +17,9 @@ data/
 Dev/
 ignore/
 .cache/
+.tools/
+.venv/
+.policy-venv/
 
 # Editor / agent scratch (never committed)
 .cursor/
